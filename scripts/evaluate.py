@@ -1,10 +1,31 @@
-import os
+"""Evaluation entrypoint.
+
+Supports:
+  - PlantVillage test evaluation (index-based split JSON)
+  - PlantVillage robustness evaluation with corruptions:
+      * Gaussian Blur: kernel=5, sigma=1.0 (thesis)
+      * Gaussian Noise: N(0, 0.05) (thesis)
+  - PlantDoc cross-domain evaluation averaged over 4 seeds (thesis)
+
+Examples:
+  python scripts/evaluate.py --model hybrid --weights checkpoints/hybrid_full_seed42.pth --data_dir data --seed 42
+  python scripts/evaluate.py --model hybrid --weights checkpoints/hybrid_full_seed42.pth --data_dir data --seed 42 --corruption blur
+  python scripts/evaluate.py --model vit --weights checkpoints/vit_full_seed42.pth --data_dir data --dataset plantdoc --plantdoc_seeds 0 1 2 3 --average
+"""
+
+from __future__ import annotations
+
 import argparse
+import json
+import os
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import datasets
 from torchvision.transforms.functional import gaussian_blur
 
 from models.resnet50_model import ResNet50Classifier
@@ -16,30 +37,48 @@ from utils.metrics import compute_metrics
 from utils.repro import set_global_seed
 
 
-def corrupt_image(img: Image.Image, blur: bool = False, noise: bool = False) -> Image.Image:
-    if blur:
-        img = gaussian_blur(img, kernel_size=[5,5], sigma=[1.0,1.0])
-    if noise:
-        arr = np.array(img).astype(np.float32) / 255.0
-        arr = np.clip(arr + np.random.normal(0, 0.05, arr.shape), 0, 1)
-        img = Image.fromarray((arr * 255).astype(np.uint8))
-    return img
+class PathLabelDataset(Dataset):
+    """A minimal dataset that stores (path,label) pairs and applies PIL->tensor transform."""
 
-
-class CorruptDataset(torch.utils.data.Dataset):
-    def __init__(self, base_dataset, blur=False, noise=False, transform=None):
-        self.base_dataset = base_dataset
-        self.blur = blur
-        self.noise = noise
+    def __init__(self, samples: List[Tuple[str, int]], loader, transform):
+        self.samples = samples
+        self.loader = loader
         self.transform = transform
 
     def __len__(self):
-        return len(self.base_dataset)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        path, label = self.base_dataset.samples[idx]
-        img = self.base_dataset.loader(path)
-        img = corrupt_image(img, blur=self.blur, noise=self.noise)
+        path, label = self.samples[idx]
+        img = self.loader(path)
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+class CorruptDataset(Dataset):
+    """Applies deterministic corruptions then transform."""
+
+    def __init__(self, samples: List[Tuple[str, int]], loader, transform, blur: bool, noise: bool):
+        self.samples = samples
+        self.loader = loader
+        self.transform = transform
+        self.blur = blur
+        self.noise = noise
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = self.loader(path)
+        # Corruptions (thesis): blur kernel=5 sigma=1.0; noise std=0.05
+        if self.blur:
+            img = gaussian_blur(img, kernel_size=[5, 5], sigma=[1.0, 1.0])
+        if self.noise:
+            arr = np.array(img).astype(np.float32) / 255.0
+            arr = np.clip(arr + np.random.normal(0, 0.05, arr.shape), 0, 1)
+            img = Image.fromarray((arr * 255).astype(np.uint8))
         if self.transform:
             img = self.transform(img)
         return img, label
@@ -48,195 +87,183 @@ class CorruptDataset(torch.utils.data.Dataset):
 def _predict(model, batch, model_type: str, device):
     if model_type == "hybrid":
         (x_cnn, x_vit), y = batch
-        x_cnn = x_cnn.to(device)
-        x_vit = x_vit.to(device)
-        y = y.to(device)
+        x_cnn = x_cnn.to(device, non_blocking=True)
+        x_vit = x_vit.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         logits = model(x_cnn, x_vit)
     else:
         x, y = batch
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         logits = model(x)
     return logits, y
 
 
+@torch.no_grad()
 def evaluate_model(model, loader, model_type: str):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
     y_true, y_pred = [], []
-    with torch.no_grad():
-        for batch in loader:
-            logits, y = _predict(model, batch, model_type, device)
-            preds = logits.argmax(dim=1)
-            y_true.extend(y.cpu().numpy().tolist())
-            y_pred.extend(preds.cpu().numpy().tolist())
+    for batch in loader:
+        logits, y = _predict(model, batch, model_type, device)
+        preds = logits.argmax(dim=1)
+        y_true.extend(y.cpu().numpy().tolist())
+        y_pred.extend(preds.cpu().numpy().tolist())
     return compute_metrics(y_true, y_pred)
 
 
-def evaluate_hybrid_corruption(model, data_dir: str, blur: bool = False, noise: bool = False):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device).eval()
-
-    test_dir = os.path.join(data_dir, "PlantVillage", "test")
-    base = datasets.ImageFolder(test_dir)
-
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for path, label in base.samples:
-            img = Image.open(path).convert("RGB")
-            img = corrupt_image(img, blur=blur, noise=noise)
-            x_cnn = val_transform_cnn(img).unsqueeze(0).to(device)
-            x_vit = val_transform_vit(img).unsqueeze(0).to(device)
-            logits = model(x_cnn, x_vit)
-            pred = logits.argmax(dim=1).item()
-            correct += int(pred == label)
-            total += 1
-    return correct / max(1, total)
+def load_split_indices(split_json: str):
+    with open(split_json, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    return obj["train_idx"], obj["val_idx"], obj["test_idx"], obj.get("class_to_idx")
 
 
-def load_model(model_name: str, weights_path: str):
-    num_classes = 38
-    if model_name == "resnet":
+def build_plantvillage_loader(
+    raw_dir: str,
+    split_json: str,
+    split_name: str,
+    model_kind: str,
+    batch_size: int,
+    num_workers: int,
+    corruption: str = "none",
+):
+    base = datasets.ImageFolder(raw_dir)
+    train_idx, val_idx, test_idx, _ = load_split_indices(split_json)
+    idx_map = {"train": train_idx, "val": val_idx, "test": test_idx}
+    indices = idx_map[split_name]
+    samples = [base.samples[i] for i in indices]
+
+    if model_kind == "hybrid":
+        # HybridDataset expects base.dataset.samples; easiest: subset base then wrap
+        # We keep base without transform; HybridDataset applies two transforms.
+        subset_base = Subset(base, indices)
+        # Subset returns (img,label) because base has loader; but HybridDataset expects .samples.
+        # So we re-create a thin ImageFolder-like object by copying samples.
+        class ThinBase:
+            def __init__(self, base, samples):
+                self.samples = samples
+                self.loader = base.loader
+
+        thin = ThinBase(base, samples)
+        ds = HybridDataset(thin, transform_cnn=val_transform_cnn, transform_vit=val_transform_vit)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+        return loader
+
+    tfm = val_transform_vit if model_kind == "vit" else val_transform_cnn
+    if corruption == "none":
+        ds = PathLabelDataset(samples, base.loader, tfm)
+    else:
+        ds = CorruptDataset(
+            samples,
+            base.loader,
+            tfm,
+            blur=(corruption == "blur"),
+            noise=(corruption == "noise"),
+        )
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    return loader
+
+
+def build_plantdoc_loader(
+    plantdoc_dir: str,
+    model_kind: str,
+    batch_size: int,
+    num_workers: int,
+):
+    tfm = val_transform_vit if model_kind == "vit" else val_transform_cnn
+    ds = datasets.ImageFolder(plantdoc_dir, transform=tfm)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    return loader
+
+
+def load_model(kind: str, num_classes: int, weights_path: str):
+    if kind == "resnet":
         model = ResNet50Classifier(num_classes=num_classes, pretrained=False)
         model_type = "resnet"
-    elif model_name == "vit":
+    elif kind == "vit":
         model = ViTClassifier(num_classes=num_classes, pretrained=False)
         model_type = "vit"
     else:
-        model = HybridCNNViTModel(num_classes=num_classes, pretrained=False)
+        model = HybridCNNViTModel(num_classes=num_classes)
         model_type = "hybrid"
-
     state = torch.load(weights_path, map_location="cpu")
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=True)
     return model, model_type
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Evaluate trained models on PlantVillage/PlantDoc")
     parser.add_argument("--model", choices=["resnet", "vit", "hybrid"], required=True)
-    parser.add_argument("--weights", required=True)
-    parser.add_argument("--data_dir", default="data")
+    parser.add_argument("--weights", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--split_json", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dataset", choices=["plantvillage", "plantdoc"], default="plantvillage")
     parser.add_argument("--corruption", choices=["none", "blur", "noise"], default="none")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--plantdoc_seeds", nargs="+", type=int, default=[0, 1, 2, 3])
-    parser.add_argument("--average", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--plantdoc_seeds", type=int, nargs="*", default=[0, 1, 2, 3])
+    parser.add_argument("--average", action="store_true", help="Average PlantDoc results over --plantdoc_seeds")
     args = parser.parse_args()
 
-    set_global_seed(args.seed, deterministic=True)
-    model, model_type = load_model(args.model, args.weights)
+    set_global_seed(args.seed)
 
-    
+    if args.split_json is None:
+        args.split_json = os.path.join(args.data_dir, "splits", "plantvillage_split_seed42.json")
+
+    raw_dir = os.path.join(args.data_dir, "PlantVillage", "raw")
+    plantdoc_dir = os.path.join(args.data_dir, "PlantDoc", "plantdoc")
+
+    # Determine num_classes from PlantVillage raw (thesis uses 38)
+    pv_base = datasets.ImageFolder(raw_dir)
+    num_classes = len(pv_base.classes)
+
+    model, model_type = load_model(args.model, num_classes=num_classes, weights_path=args.weights)
+
     if args.dataset == "plantvillage":
-        if args.split_json is None:
-            args.split_json = os.path.join(args.data_dir, "splits", f"plantvillage_split_seed{args.seed}.json")
-        raw_dir = os.path.join(args.data_dir, "PlantVillage", "raw")
-        if not os.path.isdir(raw_dir):
-            raise FileNotFoundError(f"Expected raw PlantVillage at {raw_dir}.")
-        if not os.path.isfile(args.split_json):
-            raise FileNotFoundError(f"Split JSON not found: {args.split_json}")
-
-        import json
-        with open(args.split_json, "r", encoding="utf-8") as f:
-            split = json.load(f)
-        base_ds = datasets.ImageFolder(raw_dir)
-
-        test_idx = split["test_idx"]
-
-        if args.model == "hybrid":
-            base_test = Subset(base_ds, test_idx)
-            test_dataset = HybridDataset(base_test, transform_cnn=val_transform_cnn, transform_vit=val_transform_vit)
-            test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+        bs = 32 if args.model == "vit" else 64
+        loader = build_plantvillage_loader(
+            raw_dir=raw_dir,
+            split_json=args.split_json,
+            split_name="test",
+            model_kind=args.model,
+            batch_size=bs,
+            num_workers=args.num_workers,
+            corruption=args.corruption,
+        )
+        acc, prec, rec, f1 = evaluate_model(model, loader, model_type)
+        if args.corruption == "none":
+            print(f"PlantVillage TEST | Acc: {acc*100:.2f}% | Prec(macro): {prec*100:.2f}% | Rec(macro): {rec*100:.2f}% | F1(macro): {f1*100:.2f}%")
         else:
-            transform = val_transform_vit if args.model == "vit" else val_transform_cnn
-            test_dataset = Subset(datasets.ImageFolder(raw_dir, transform=transform), test_idx)
-            test_loader = DataLoader(test_dataset, batch_size=(32 if args.model=="vit" else 64), shuffle=False, num_workers=4, pin_memory=True)
-
-        # Apply corruption if specified
-        if args.corruption != "none":
-            if args.model == "hybrid":
-                acc = evaluate_hybrid_corruption(model, blur=(args.corruption=="blur"), noise=(args.corruption=="noise"),
-                                                data_dir=args.data_dir, split_json=args.split_json, seed=args.seed)
-                print(f"Hybrid model accuracy on {args.corruption} PlantVillage test: {acc*100:.2f}%")
-                exit(0)
-            else:
-                # CorruptDataset expects an ImageFolder-like .samples; build from raw and then subset via indices list
-                base_test_raw = datasets.ImageFolder(raw_dir)
-                # create a thin wrapper with only samples in test_idx
-                class Wrapper(torch.utils.data.Dataset):
-                    def __init__(self, base, indices):
-                        self.base=base
-                        self.indices=indices
-                        self.samples=[base.samples[i] for i in indices]
-                        self.loader=base.loader
-                    def __len__(self): return len(self.indices)
-                    def __getitem__(self, idx):
-                        p,l = self.samples[idx]
-                        return p,l
-                w = Wrapper(base_test_raw, test_idx)
-                test_dataset = CorruptDataset(w,
-                                              blur=(args.corruption=="blur"), noise=(args.corruption=="noise"),
-                                              transform=(val_transform_vit if args.model=="vit" else val_transform_cnn))
-                test_loader = DataLoader(test_dataset, batch_size=(32 if args.model=="vit" else 64), shuffle=False, num_workers=4, pin_memory=True)
-
-        acc, prec, rec, f1 = evaluate_model(model, test_loader, model_type=model_type)
-        print(f"Accuracy: {acc*100:.2f}%, Precision (macro): {prec*100:.2f}%, Recall (macro): {rec*100:.2f}%, F1 (macro): {f1*100:.2f}%")
-else:
-            tfm = val_transform_vit if args.model == "vit" else val_transform_cnn
-            base = datasets.ImageFolder(test_dir, transform=tfm)
-            if args.corruption != "none":
-                ds = CorruptDataset(datasets.ImageFolder(test_dir),
-                                    blur=args.corruption == "blur",
-                                    noise=args.corruption == "noise",
-                                    transform=tfm)
-            else:
-                ds = base
-
-        if args.model == "hybrid" and args.corruption != "none":
-            acc = evaluate_hybrid_corruption(model, args.data_dir,
-                                             blur=args.corruption == "blur",
-                                             noise=args.corruption == "noise")
-            print(f"Hybrid accuracy ({args.corruption}) = {acc*100:.2f}%")
-            return
-
-        loader = DataLoader(ds, batch_size=(32 if args.model == "vit" else 64), shuffle=False)
-        acc, prec, rec, f1 = evaluate_model(model, loader, model_type)
-        print(f"Accuracy: {acc*100:.2f}% | Precision(macro): {prec*100:.2f}% | Recall(macro): {rec*100:.2f}% | F1(macro): {f1*100:.2f}%")
+            print(f"PlantVillage TEST ({args.corruption}) | Acc: {acc*100:.2f}% | Prec(macro): {prec*100:.2f}% | Rec(macro): {rec*100:.2f}% | F1(macro): {f1*100:.2f}%")
         return
 
-    # PlantDoc (cross-domain)
-    pd_dir = os.path.join(args.data_dir, "PlantDoc", "plantdoc")
-    tfm = val_transform_vit if args.model == "vit" else val_transform_cnn
-    base_pd = datasets.ImageFolder(pd_dir, transform=tfm)
-
-    pv_classes = set(datasets.ImageFolder(os.path.join(args.data_dir, "PlantVillage", "train")).classes)
-    keep_idx = [i for i, (_, y) in enumerate(base_pd.samples) if base_pd.classes[y] in pv_classes]
-    pd_ds = Subset(base_pd, keep_idx)
-
-    loader = DataLoader(pd_ds, batch_size=(32 if args.model == "vit" else 64), shuffle=False)
-
+    # PlantDoc
+    bs = 32 if args.model == "vit" else 64
     if not args.average:
+        loader = build_plantdoc_loader(plantdoc_dir, args.model, bs, args.num_workers)
         acc, prec, rec, f1 = evaluate_model(model, loader, model_type)
-        print(f"PlantDoc — Accuracy: {acc*100:.2f}% | Precision(macro): {prec*100:.2f}% | Recall(macro): {rec*100:.2f}% | F1(macro): {f1*100:.2f}%")
+        print(f"PlantDoc | Acc: {acc*100:.2f}% | Prec(macro): {prec*100:.2f}% | Rec(macro): {rec*100:.2f}% | F1(macro): {f1*100:.2f}%")
         return
 
-    # Average over multiple seeds (deterministic data order, but noise/augmentation could depend on seed)
-    runs = []
+    # Average over multiple seeds (thesis requirement).
+    results = []
     for s in args.plantdoc_seeds:
-        set_global_seed(s, deterministic=True)
-        acc, prec, rec, f1 = evaluate_model(model, loader, model_type)
-        runs.append([acc, prec, rec, f1])
-        print(f"Seed {s}: acc={acc*100:.2f} f1={f1*100:.2f}")
+        set_global_seed(s)
+        loader = build_plantdoc_loader(plantdoc_dir, args.model, bs, args.num_workers)
+        results.append(evaluate_model(model, loader, model_type))
 
-    arr = np.array(runs)
+    arr = np.array(results, dtype=np.float32)  # shape (k,4)
     mean = arr.mean(axis=0)
     std = arr.std(axis=0)
-    print("\nPlantDoc (mean±std over seeds)")
-    print(f"Accuracy: {mean[0]*100:.2f}±{std[0]*100:.2f}%")
-    print(f"Precision(macro): {mean[1]*100:.2f}±{std[1]*100:.2f}%")
-    print(f"Recall(macro): {mean[2]*100:.2f}±{std[2]*100:.2f}%")
-    print(f"F1(macro): {mean[3]*100:.2f}±{std[3]*100:.2f}%")
+    print(
+        "PlantDoc (avg over seeds: "
+        + ",".join(map(str, args.plantdoc_seeds))
+        + ") | "
+        + f"Acc: {mean[0]*100:.2f}±{std[0]*100:.2f}% | "
+        + f"Prec: {mean[1]*100:.2f}±{std[1]*100:.2f}% | "
+        + f"Rec: {mean[2]*100:.2f}±{std[2]*100:.2f}% | "
+        + f"F1: {mean[3]*100:.2f}±{std[3]*100:.2f}%"
+    )
 
 
 if __name__ == "__main__":
